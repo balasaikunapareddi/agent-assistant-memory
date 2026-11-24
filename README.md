@@ -115,6 +115,8 @@ Notes on the numbers: coverage is 2/3, not 3/3 — the summary prose omits the r
 
 The live *demo* (`demo --llm gemini`) did not complete: Gemini returned 503 (model high demand) in session C, on the first run and again on the one retry after ~2.5 minutes. The stub demo passes end to end, and the live test above — which exercises the same live compaction + grounded answer — passed on its first attempt.
 
+Post-review re-run (2026-11-24, attempt 2, coordinator): **LIVE TEST PASSED** after the review's write-back guards — compaction 206→47 tokens, coverage 2/3 = 0.67, retrieval 4/4, fresh-session answer "You live in Dallas, Texas.", Austin not leaked. Report: `.runs/live/attempt-2/report.json`.
+
 Offline suite: **66 tests pass** (`pytest tests/ -q`), deterministic, stub LLM only.
 
 ## Honest limits
