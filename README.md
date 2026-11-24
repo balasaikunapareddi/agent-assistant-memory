@@ -62,7 +62,7 @@ store.claim_history("alex", "home city")       # both rows: replaced + active
 
 A session is one conversation: its own transcript, its own working context, and a link to the session it was handed off from. Memory is *not* per-session — it lives in the durable store — so a fact learned in session A is available in session B. `handoff()` starts a new session carrying a summary of the old one, so the user never repeats themselves; the old transcript stays intact under its own id.
 
-The working context is the window the LLM actually sees: an optional compacted summary plus recent turns, inside a token budget (estimated as chars / 4, labelled as an estimate everywhere). When the window exceeds the budget, the oldest turns go to the compactor instead of being dropped.
+When the window is over budget, the oldest turns go to the compactor instead of being dropped. Compaction runs in passes (up to 5 per chat turn, stopping early when a pass shrinks nothing) until the window fits the budget — one pass is not guaranteed to fit, so the budget is enforced by a loop, not a single attempt. If a single turn (or the summary itself) is larger than the whole budget, the window can stay over budget: the mechanism never drops turns just to force the number down.
 
 ### Retrieval (`retrieval.py`)
 
@@ -70,7 +70,7 @@ Search scores active claims only: **keyword match (0.6) + recency (0.15) + salie
 
 ### Compaction (`compaction.py`)
 
-When the window is over budget, the oldest half of the turns is summarized by the LLM in a fixed format — a short summary plus a `Durable facts:` list — and the summary replaces those turns in the window. Facts from the summary are written back into the memory store. Every compaction is recorded (token counts before/after, summary, turn ids, facts preserved/total), and `verify_summary()` checks it deterministically: for each durable fact, what fraction of its content words appear in the summary. A compaction with low coverage is visible in the record, not silently trusted.
+When the window is over budget, the oldest half of the turns is summarized by the LLM in a fixed format — a short summary plus a `Durable facts:` list — and the summary replaces those turns in the window. Facts from the summary are written back into the memory store, but only when they add something new: a compaction fact is skipped when the store already holds it (under any subject), holds a near-identical active claim, or deliberately retired an identical one (replaced or forgotten) — and compaction never supersedes anything, so two facts that map to the same derived subject cannot overwrite each other. A skipped fact is not lost: it stays in the summary, the compaction record, and the original turns. Every compaction is recorded (token counts before/after, summary, turn ids, facts preserved/total), and `verify_summary()` checks it deterministically: for each durable fact, what fraction of its content words appear in the summary. A compaction with low coverage is visible in the record, not silently trusted. A compaction that extracts no facts at all records coverage 0.0 (unverified), never a vacuous 1.0.
 
 ### The agent (`agent.py`)
 
@@ -111,17 +111,18 @@ Result (run firsthand, 2026-11-24, attempt 1 — no retry needed):
 [live] LIVE TEST PASSED
 ```
 
-Notes on the numbers: coverage is 2/3, not 3/3 — the summary prose omits the residence fact ("Alex lives in Dallas") even though the model's `Durable facts:` list captured all three and all three were written back to the store. The verification caught a real imperfection instead of hiding it; the threshold in the live test is ≥ 0.5. Full report: `.runs/live/attempt-1/report.json`.
+Notes on the numbers: coverage is 2/3, not 3/3 — the summary prose omits the residence fact ("Alex lives in Dallas") even though the model's `Durable facts:` list captured all three and all three were written back to the store. The verification caught a real imperfection instead of hiding it; the threshold in the live test is ≥ 0.5. Full report: `.runs/live/attempt-1/report.json`. (Review note: in that run, one of the three stored facts superseded another under the same derived subject — "the garden-planner app" — so only two of the three stayed active. The write-back guards added in the 2026-11-24 review now prevent that: a re-run would store only the genuinely new fact. The attempt-1 numbers above are the as-run record, unchanged.)
 
 The live *demo* (`demo --llm gemini`) did not complete: Gemini returned 503 (model high demand) in session C, on the first run and again on the one retry after ~2.5 minutes. The stub demo passes end to end, and the live test above — which exercises the same live compaction + grounded answer — passed on its first attempt.
 
-Offline suite: **51 tests pass** (`pytest tests/ -q`), deterministic, stub LLM only.
+Offline suite: **66 tests pass** (`pytest tests/ -q`), deterministic, stub LLM only.
 
 ## Honest limits
 
 - Token counts are estimates (chars / 4), not a real tokenizer's counts — the budget mechanism is exact, the unit is approximate, and every report says so.
 - Retrieval is keyword + recency + salience scoring, not embeddings — it is explainable and dependency-free, and it ranks short factual memories well; it will miss paraphrases that share no words with the stored claim.
-- Compaction facts are parsed from the LLM's fixed-format reply; if a live model ignores the format, the raw reply is kept as the summary and the coverage check will show it.
+- Compaction facts are parsed from the LLM's fixed-format reply; if a live model ignores the format, the raw reply is kept as the summary and the coverage check will show it (0.0 when no facts were extracted). An empty compaction reply raises instead of silently dropping the turns, and a backend failure (503) during the answer or compaction propagates — the turns already stored stay stored and the window is left untouched, so the caller sees the failure and can retry.
+- Reopening a session restores its latest compaction summary (or its handoff summary) and skips turns a compaction already removed, so compacted turns are never resurrected into the window.
 - The demo user is fictional (Alex Rivera) on purpose, so the demo never mixes with any real person's facts.
 
 ## Layout
@@ -138,7 +139,7 @@ src/agent_assistant_memory/
   agent.py       AssistantAgent — retrieve → inject → answer → compact
   demo.py        four-day, four-session demo (stub or live)
 scripts/live_test.py   live Gemini compaction + grounded answer + probe set
-tests/           51 offline tests (stub LLM only)
+tests/           66 offline tests (stub LLM only)
 ```
 
 ## License

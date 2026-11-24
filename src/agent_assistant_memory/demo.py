@@ -92,6 +92,8 @@ def run_demo(db_path: str = ":memory:", llm_name: str = "stub",
         # Force one compaction pass so the demo always shows it.
         window = agent.sessions.window(sess_c)
         compaction = agent._compact_window(sess_c, window)
+        if compaction is None:
+            raise RuntimeError("demo: session C produced no compaction candidates")
         print("  (forced one compaction pass at end of session C)")
 
     print("\n--- Compaction ---")
@@ -142,7 +144,7 @@ def main() -> int:
     p = argparse.ArgumentParser(description="agent-assistant-memory demo")
     p.add_argument("--llm", default="stub", choices=["stub", "gemini"])
     p.add_argument("--db", default=":memory:")
-    p.add_argument("--budget", type=int, default=300)
+    p.add_argument("--budget", type=int, default=400)
     args = p.parse_args()
     result = run_demo(db_path=args.db, llm_name=args.llm, budget_tokens=args.budget)
     return 0 if result["corrected_used"] and not result["old_leaked"] else 1

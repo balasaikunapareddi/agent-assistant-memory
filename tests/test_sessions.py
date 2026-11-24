@@ -31,6 +31,34 @@ def test_reopening_a_session_reloads_its_turns(mgr):
     assert [m["content"] for m in window.messages] == ["first", "second"]
 
 
+def test_reopening_a_session_skips_compacted_turns_and_restores_summary(mgr):
+    """Reopening must not resurrect turns a compaction already removed
+    from the window — they live on in the summary, which is restored.
+    (Previously every stored turn came back and the summary was lost,
+    so a later compaction could record the same turn ids twice.)"""
+    store = mgr.store
+    a = mgr.start_session("u1", title="long")
+    for i in range(4):
+        mgr.add_turn(a, "u1", "user", f"turn {i}")
+    turns = store.get_turns(a)
+    store.record_compaction(a, "u1", 100, 10, "Summary of turns 0-1.",
+                            [turns[0]["id"], turns[1]["id"]], 1, 1)
+    fresh = SessionManager(store, budget_tokens=200)
+    window = fresh.open_session(a)
+    assert [m["content"] for m in window.messages] == ["turn 2", "turn 3"]
+    assert window.summary == "Summary of turns 0-1."
+
+
+def test_reopening_handoff_session_restores_handoff_summary(mgr):
+    a = mgr.start_session("u1", title="old")
+    mgr.add_turn(a, "u1", "user", "planning the app")
+    new_id = mgr.handoff("u1", a, "User is planning the garden app; deadline Friday.")
+    fresh = SessionManager(mgr.store, budget_tokens=200)
+    window = fresh.open_session(new_id)
+    assert window.summary == "User is planning the garden app; deadline Friday."
+    assert window.messages == []
+
+
 def test_opening_unknown_session_raises(mgr):
     with pytest.raises(KeyError):
         mgr.open_session("sess-nope")
@@ -62,6 +90,13 @@ def test_context_window_budget_enforcement():
     w.add("user", "word " * 100)  # ~125 tokens
     assert w.over_budget()
     assert w.tokens() > 20
+
+
+def test_window_exactly_at_budget_is_not_over():
+    w = ContextWindow(budget_tokens=10)
+    w.add("user", "x" * 40)  # exactly 10 est. tokens
+    assert w.tokens() == 10
+    assert not w.over_budget()
 
 
 def test_compactable_messages_keep_the_newest():

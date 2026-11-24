@@ -20,10 +20,15 @@ import re
 from .compaction import Compactor
 from .llm import make_llm
 from .prompts import MEMORY_PREAMBLE_TEMPLATE, SYSTEM_PROMPT
-from .retrieval import format_memories, search_memory
+from .retrieval import format_memories, search_memory, tokenize
 from .sessions import SessionManager
 from .store import MemoryStore
 from .tokens import estimate_tokens
+
+# Compaction is retried while the window is over budget, but never
+# more than this many passes per chat turn: a pass that shrinks
+# nothing (or an LLM that keeps failing) must not burn calls.
+MAX_COMPACTION_PASSES = 5
 
 
 def _subject_from_fact(fact: str) -> str:
@@ -99,14 +104,32 @@ class AssistantAgent:
         messages += window.as_messages()
         messages.append({"role": "user", "content": user_text})
 
-        reply = self.llm.reply(messages)
         tokens_before = window.tokens()
+        # Store the user turn BEFORE calling the LLM, so a backend
+        # failure (503, timeout) does not silently lose the user's
+        # message from the transcript.
         self.sessions.add_turn(session_id, self.user_id, "user", user_text)
+        reply = self.llm.reply(messages)
         self.sessions.add_turn(session_id, self.user_id, "assistant", reply)
 
+        # Compact in passes until the window fits the budget (or no
+        # further pass helps). One pass is usually enough; a single
+        # pass is not guaranteed to fit, so a "hard budget" needs
+        # the loop. A compaction error propagates loudly — the turns
+        # are already stored, the window is untouched, nothing is
+        # silently dropped.
         compacted = None
         if window.over_budget():
-            compacted = self._compact_window(session_id, window)
+            passes = 0
+            while window.over_budget() and passes < MAX_COMPACTION_PASSES:
+                before = window.tokens()
+                result = self._compact_window(session_id, window)
+                if result is None:
+                    break
+                compacted = result
+                passes += 1
+                if window.tokens() >= before:
+                    break  # no progress: further passes will not help
 
         self.last_chat = {
             "session_id": session_id,
@@ -120,12 +143,42 @@ class AssistantAgent:
         }
         return reply
 
-    def _compact_window(self, session_id: str, window) -> dict:
+    def _fact_already_known(self, fact_text: str, active: list[dict]) -> bool:
+        """True when the store already holds this fact (identical text
+        under any subject), holds an active claim that says nearly
+        the same thing (>= 50% content-word overlap), or deliberately
+        retired an identical claim (replaced or forgotten). In all
+        three cases the store wins and the compaction fact is not
+        re-stored — this is what stops compaction from resurrecting
+        a superseded fact from old turns."""
+        lowered = fact_text.strip().lower()
+        for claim in active:
+            if claim["text"].strip().lower() == lowered:
+                return True
+        fact_words = tokenize(fact_text)
+        if fact_words:
+            for claim in active:
+                overlap = (len(fact_words & tokenize(claim["text"]))
+                           / len(fact_words))
+                if overlap >= 0.5:
+                    return True
+        retired = self.store.find_retired_claim_by_text(self.user_id, fact_text)
+        return retired is not None
+
+    def _compact_window(self, session_id: str, window) -> dict | None:
         """Compact the oldest half of the window; persist the facts
-        the compaction surfaced and record the compaction."""
+        the compaction surfaced and record the compaction. Returns
+        None when there is nothing to compact.
+
+        Write-back is deliberately conservative: a compaction fact is
+        only stored when it adds something new. It never supersedes
+        an active claim, never restates one, and never resurrects a
+        retired one (see _fact_already_known). Such facts stay in the
+        summary, the compaction record and the original turns — not
+        lost, just not re-stored as live memory."""
         candidates = window.compactable_messages()
         if not candidates:
-            return {}
+            return None
         # Map window messages back to stored turn ids: the window
         # holds turns in store order, minus turns already compacted
         # away in earlier passes (recorded in the store).
@@ -140,19 +193,26 @@ class AssistantAgent:
         result = self.compactor.compact(candidates, existing_summary=window.summary)
         window.drop_messages(candidates)
         window.set_summary(result.summary)
-        # Persist durable facts from the compaction (dedupe by subject+text
-        # is handled in the store: identical re-statements are no-ops).
+        # Persist durable facts from the compaction — but only facts
+        # that add something new (see _fact_already_known), and never
+        # under a subject that already holds a different active claim:
+        # compaction is a summarizer, not a correction, so it must
+        # never supersede anything.
+        active = self.store.active_claims(self.user_id)
         stored_facts = []
         for fact in result.durable_facts:
-            subject = _subject_from_fact(fact)
-            # Skip facts that merely restate an already-active claim.
+            fact_text = fact.strip()
+            if not fact_text or self._fact_already_known(fact_text, active):
+                continue
+            subject = _subject_from_fact(fact_text)
             existing = self.store.get_active(self.user_id, subject)
-            if existing and existing["text"].strip().lower() == fact.strip().lower():
+            if existing and existing["text"].strip().lower() != fact_text.lower():
                 continue
             claim = self.store.remember(
-                self.user_id, subject, fact, kind="fact",
+                self.user_id, subject, fact_text, kind="fact",
                 source_session_id=session_id, salience=0.6)
             stored_facts.append(claim)
+            active.append(claim)
         self.store.record_compaction(
             session_id, self.user_id, result.tokens_before, result.tokens_after,
             result.summary, turn_ids, result.facts_preserved, result.facts_total)

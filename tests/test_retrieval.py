@@ -43,6 +43,14 @@ def test_replaced_claim_never_retrieved(store):
     assert hits[0]["text"].startswith("Alex lives in Dallas")
 
 
+def test_query_matching_only_superseded_claim_returns_nothing(store):
+    """A query whose only keyword match is the retired wording must
+    return nothing — the replaced claim is history, not an answer."""
+    store.remember("u1", "home city", "Alex lives in Austin, Texas")
+    store.correct("u1", "home city", "Alex lives in Dallas, Texas")
+    assert search_memory(store, "u1", "Austin") == []
+
+
 def test_forgotten_claim_never_retrieved(store):
     store.forget("u1", "favourite food")
     assert search_memory(store, "u1", "what food do I love tacos") == []

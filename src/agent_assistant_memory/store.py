@@ -207,6 +207,19 @@ class MemoryStore:
             self._conn.commit()
             return True
 
+    def find_retired_claim_by_text(self, user_id: str, text: str) -> dict | None:
+        """Most recent non-active claim with this exact text
+        (case-insensitive), or None. Lets compaction write-back check
+        whether a fact was deliberately retired (replaced or
+        forgotten) so it is never resurrected as a live claim."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM claims WHERE user_id = ? "
+                "AND text = ? COLLATE NOCASE AND status != 'active' "
+                "ORDER BY id DESC LIMIT 1",
+                (user_id, text.strip())).fetchone()
+        return dict(row) if row else None
+
     # -- sessions / turns ------------------------------------------------
 
     def create_session(self, session_id: str, user_id: str, title: str | None = None,

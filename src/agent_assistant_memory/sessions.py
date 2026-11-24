@@ -21,7 +21,11 @@ from .tokens import count_messages, estimate_tokens
 
 
 class ContextWindow:
-    """Ordered working context with a hard token budget."""
+    """Ordered working context with a token budget. The budget is
+    enforced by the agent (repeated compaction passes while over
+    budget); a single turn larger than the whole budget can still
+    leave the window over it, since turns are never dropped just to
+    force the number down."""
 
     def __init__(self, budget_tokens: int = 2000):
         if budget_tokens <= 0:
@@ -82,13 +86,30 @@ class SessionManager:
 
     def open_session(self, session_id: str) -> ContextWindow:
         """Reopen an existing session, reloading its turns into a
-        fresh working context."""
+        fresh working context. Turns already compacted away are NOT
+        reloaded (they live on in the compaction summary, which is
+        restored); otherwise reopening would resurrect compacted
+        turns and a later compaction could record the same turn ids
+        twice. A handoff session with no compactions restores its
+        handoff summary instead."""
         session = self.store.get_session(session_id)
         if session is None:
             raise KeyError(f"unknown session: {session_id}")
         window = ContextWindow(self.budget_tokens)
+        compacted_ids: set[int] = set()
+        latest_summary: str | None = None
+        for rec in self.store.list_compactions(session_id):
+            compacted_ids.update(
+                int(x) for x in rec["turn_ids"].split(",") if x.strip())
+            latest_summary = rec["summary"]
         for turn in self.store.get_turns(session_id):
+            if turn["id"] in compacted_ids:
+                continue
             window.add(turn["role"], turn["content"])
+        if latest_summary:
+            window.set_summary(latest_summary)
+        elif session.get("handoff_summary"):
+            window.set_summary(session["handoff_summary"])
         self._windows[session_id] = window
         return window
 

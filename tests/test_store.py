@@ -108,3 +108,29 @@ def test_turns_and_sessions_persist(store):
     assert [t["role"] for t in turns] == ["user", "assistant"]
     assert store.get_session("s1")["title"] == "first"
     assert store.session_tokens("s1") > 0
+
+
+def test_supersede_chain_three_corrections(store):
+    a = store.remember("u1", "home city", "Austin")
+    b = store.correct("u1", "home city", "Dallas")
+    c = store.correct("u1", "home city", "Houston")
+    assert b["supersedes"] == a["id"] and c["supersedes"] == b["id"]
+    history = store.claim_history("u1", "home city")
+    assert [h["status"] for h in history] == ["replaced", "replaced", "active"]
+    assert history[0]["superseded_by"] == b["id"]
+    assert history[1]["superseded_by"] == c["id"]
+    assert store.get_active("u1", "home city")["text"] == "Houston"
+
+
+def test_find_retired_claim_by_text(store):
+    store.remember("u1", "home city", "Alex lives in Austin, Texas")
+    store.correct("u1", "home city", "Alex lives in Dallas, Texas")
+    retired = store.find_retired_claim_by_text("u1", "Alex lives in Austin, Texas")
+    assert retired is not None and retired["status"] == "replaced"
+    # The live claim is not "retired", and unknown text finds nothing.
+    assert store.find_retired_claim_by_text("u1", "Alex lives in Dallas, Texas") is None
+    assert store.find_retired_claim_by_text("u1", "never said") is None
+    store.remember("u1", "food", "Alex loves tacos")
+    store.forget("u1", "food")
+    found = store.find_retired_claim_by_text("u1", "alex LOVES tacos")
+    assert found is not None and found["status"] == "forgotten"

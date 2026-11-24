@@ -61,7 +61,10 @@ def parse_compaction_reply(reply: str) -> tuple[str, list[str]]:
 def verify_summary(summary: str, facts: list[str]) -> tuple[int, int, float]:
     """Check each durable fact against the summary by content-word
     overlap. A fact counts as preserved when >= 50% of its content
-    words appear in the summary. Returns (preserved, total, coverage)."""
+    words appear in the summary. Returns (preserved, total, coverage).
+    With no facts to check, coverage is 0.0 (unverified) — not a
+    vacuous 1.0 — so a reply that extracted no facts can never
+    masquerade as a perfect compaction."""
     summary_words = tokenize(summary)
     preserved = 0
     for fact in facts:
@@ -72,7 +75,7 @@ def verify_summary(summary: str, facts: list[str]) -> tuple[int, int, float]:
         if overlap >= 0.5:
             preserved += 1
     total = len([f for f in facts if tokenize(f)])
-    coverage = (preserved / total) if total else 1.0
+    coverage = (preserved / total) if total else 0.0
     return preserved, total, coverage
 
 
@@ -98,6 +101,13 @@ class Compactor:
             {"role": "system", "content": "You compact conversations. Follow the requested format exactly."},
             {"role": "user", "content": prompt},
         ])
+        if not reply or not reply.strip():
+            # Fail loudly: an empty reply must never silently drop the
+            # turns it was meant to summarize. The caller keeps the
+            # turns (still in the store and in the window) and can
+            # retry; no compaction is recorded.
+            raise ValueError(
+                "compaction LLM returned an empty reply; turns left uncompacted")
         summary, facts = parse_compaction_reply(reply)
         if not summary:
             # LLM ignored the format: keep the raw reply as the summary
